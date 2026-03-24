@@ -37,20 +37,14 @@ def save_json(path: Path, data: dict):
 
 
 def init_splats(scene: ColmapScene, args, device: str):
-    use_random = bool(args.ignore_tie_points) or len(scene.points) == 0
-    if use_random:
-        points = torch.rand((args.init_points, 3), dtype=torch.float32)
-        points = (points * 2.0 - 1.0) * scene.scene_scale
-        rgbs = torch.full((args.init_points, 3), 0.5, dtype=torch.float32)
-    else:
-        points_np = scene.points
-        rgb_np = scene.points_rgb / 255.0
-        if len(points_np) > args.init_points:
-            idx = np.random.choice(len(points_np), size=args.init_points, replace=False)
-            points_np = points_np[idx]
-            rgb_np = rgb_np[idx]
-        points = torch.from_numpy(points_np).float()
-        rgbs = torch.from_numpy(rgb_np).float()
+    points_np = scene.points
+    rgb_np = scene.points_rgb / 255.0
+    if len(points_np) > args.init_points:
+        idx = np.random.choice(len(points_np), size=args.init_points, replace=False)
+        points_np = points_np[idx]
+        rgb_np = rgb_np[idx]
+    points = torch.from_numpy(points_np).float()
+    rgbs = torch.from_numpy(rgb_np).float()
 
     n = points.shape[0]
     base_scale = max(scene.scene_scale / 80.0, 1e-4)
@@ -117,30 +111,12 @@ class Trainer:
         self.stats_dir = self.out / "stats"
         self.vis_dir = self.out / "vis"
         self.train_vis_dir = self.out / "train_vis"
-        self.gs_trace_dir = self.out / "gs_trace"
-        for d in (self.ckpt_dir, self.stats_dir, self.vis_dir, self.train_vis_dir, self.gs_trace_dir):
+        for d in (self.ckpt_dir, self.stats_dir, self.vis_dir, self.train_vis_dir):
             d.mkdir(parents=True, exist_ok=True)
         save_json(self.out / "config.json", vars(args))
 
         self.geom_warmup_steps = 600
         self.warmup_weight_floor = 0.05
-        self.gs_trace_warmup_every = 50
-        self.gs_trace_post_every = 100
-        self.gs_trace_post_steps = 800
-        self._save_gs_trace(step=0)
-    def _save_gs_trace(self, step: int):
-        torch.save({"step": int(step), "means": self.splats["means"].detach().cpu()}, self.gs_trace_dir / f"means_{step:06d}.pt")
-
-    def _maybe_save_gs_trace(self, step: int):
-        if step <= self.geom_warmup_steps:
-            every = self.gs_trace_warmup_every
-        elif step <= self.geom_warmup_steps + self.gs_trace_post_steps:
-            every = self.gs_trace_post_every
-        else:
-            return
-        if step % every == 0:
-            self._save_gs_trace(step)
-
     def _rasterize_gs(self, c2w, K, W, H, sh_degree):
         colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
         rc, ra, info = rasterization(
@@ -260,7 +236,6 @@ class Trainer:
                 hybrid_psnr = psnr(out["hybrid"], out["gt"])
 
             step1 = step + 1
-            self._maybe_save_gs_trace(step1)
             phase = "warmup" if warmup else "full"
             pbar.set_description(
                 f"step={step1} phase={phase} loss={loss.item():.4f} mesh_psnr={mesh_psnr:.2f} hybrid_psnr={hybrid_psnr:.2f} gs={len(self.splats['means'])}"
