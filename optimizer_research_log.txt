@@ -1,0 +1,92 @@
+Implemented selective metrics
+1) repair_gain
+   mean( max(mesh_err - hybrid_err, 0) ) on bad_region
+   Interpretation: how much hybrid repairs truly problematic mesh areas.
+
+2) preserve_damage
+   mean( max(hybrid_err - mesh_err, 0) ) on good_region
+   Interpretation: how much hybrid breaks already good mesh areas.
+
+3) selectivity_score = repair_gain - preserve_damage
+   Interpretation: single scalar for "fix hard places without breaking good places".
+
+4) leakage_good
+   mean( alpha_eff ) on good_region, where alpha_eff = gs_alpha * gate
+   Interpretation: how much GS contribution enters zones where mesh is already good.
+
+5) blur_regression_good
+   Let G(x) = simple image gradient magnitude.
+   Compare |G(mesh)-G(gt)| vs |G(hybrid)-G(gt)| on good_region.
+   Metric = mean( max( |G(hybrid)-G(gt)| - |G(mesh)-G(gt)|, 0 ) )
+   Interpretation: positive means hybrid introduces extra blur/edge loss vs mesh.
+
+6) good_region_ratio, bad_region_ratio
+   Interpretation: sanity that selected regions are non-empty and stable.
+
+
+
+[2026-03-23] Hypothesis patch prep: cap GS count + freer means motion
+
+
+
+User preference update
+- Do not add extra penalty terms/hardcoded punishments in train loss for now.
+- Primary intervention: initialize GS away from mesh-perfect zones, so GS starts as residual carrier instead of competing with already-good mesh.
+
+[2026-03-24] Minimal staged training (no new CLI flags), with explicit backup
+
+User constraint update
+- Keep launch surface minimal: no new CLI flags for this hypothesis.
+- Mandatory reversibility: create explicit backup before edits.
+
+Backup
+- Created: backup_train_before_staged_20260324_2.py
+- Purpose: instant rollback to pre-staged train logic.
+
+Code changes (train.py only)
+1) Kept init source check explicit
+- init_splats still prints source and uses tie-points unless --ignore_tie_points=1.
+- This confirms your suspicion path: by default GS starts exactly from COLMAP tie points.
+
+2) Added internal staged constants (not CLI)
+- self.geom_warmup_steps = 600
+- self.warmup_weight_floor = 0.05
+- self._phase_msg_sent = False
+
+3) Added warmup predicate
+- _is_geom_warmup(step): True for step < geom_warmup_steps.
+
+4) Warmup residual gating in _forward
+- During warmup only: weights below warmup_weight_floor are zeroed.
+- Effect: near-perfect mesh regions do not produce early gradients for GS.
+
+5) Staged optimizer behavior in train loop
+- Warmup phase:
+  - optimize only means (positions)
+  - freeze scales/quats/opacities/sh0/shN via requires_grad_(False)
+  - disable strategy pre/post hooks (no densify/prune pressure in phase 1)
+  - skip max_gs pruning in warmup
+- Full phase (after warmup):
+  - restore full optimization and strategy behavior as before
+
+6) Progress transparency
+- Added phase prints:
+  - warmup settings at first step
+  - transition message when warmup ends
+- tqdm line now includes phase=warmup|full.
+
+Why this directly targets current failure mode
+- If GS initializes on already-good mesh surfaces, early unrestricted color/opacity fitting can lock splats there.
+- Means-only + residual floor pushes the first gradients toward mesh-error regions instead of repainting perfect mesh.
+- Delaying strategy avoids early GS population growth before this positional correction phase completes.
+
+Validation run (local)
+- python -m py_compile train.py hybrid_math.py selfcheck.py -> OK
+- python selfcheck.py -> [OK] distillate selfcheck passed
+
+Interpretation status
+- This is intentionally a minimal behavioral intervention (schedule only), not a new loss term family.
+- Hypothesis to verify on yellow_car:
+  1) leakage_good should drop in early evals
+  2) splats should appear less on ideal car body and more near windshield residuals
+  3) preserve_damage/blur_regression_good should improve at equal or better hybrid_psnr trend
