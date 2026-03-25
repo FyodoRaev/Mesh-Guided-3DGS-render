@@ -17,7 +17,6 @@ from gsplat.strategy.ops import remove
 from hybrid_math import (
     compute_depth_gate,
     compose_hybrid,
-    psnr,
     residual_weight_from_mesh_error,
     selective_metrics,
     weighted_l1,
@@ -39,10 +38,14 @@ def save_json(path: Path, data: dict):
 def init_splats(scene: ColmapScene, args, device: str):
     points_np = scene.points
     rgb_np = scene.points_rgb / 255.0
+    if len(points_np) == 0:
+        raise RuntimeError("No COLMAP tie-points found: random init disabled by design")
+
     if len(points_np) > args.init_points:
         idx = np.random.choice(len(points_np), size=args.init_points, replace=False)
         points_np = points_np[idx]
         rgb_np = rgb_np[idx]
+
     points = torch.from_numpy(points_np).float()
     rgbs = torch.from_numpy(rgb_np).float()
 
@@ -56,7 +59,7 @@ def init_splats(scene: ColmapScene, args, device: str):
         "sh0": torch.nn.Parameter(rgb_to_sh(rgbs.to(device)).unsqueeze(1)),
         "shN": torch.nn.Parameter(torch.zeros((n, (args.sh_degree + 1) ** 2 - 1, 3), device=device)),
     }
-    print(f"[init] source={'random' if use_random else 'tie_points'} num_gs={n}")
+    print(f"[init] source=tie_points num_gs={n}")
     return torch.nn.ParameterDict(params)
 
 
@@ -110,13 +113,13 @@ class Trainer:
         self.ckpt_dir = self.out / "ckpts"
         self.stats_dir = self.out / "stats"
         self.vis_dir = self.out / "vis"
-        self.train_vis_dir = self.out / "train_vis"
-        for d in (self.ckpt_dir, self.stats_dir, self.vis_dir, self.train_vis_dir):
+        for d in (self.ckpt_dir, self.stats_dir, self.vis_dir):
             d.mkdir(parents=True, exist_ok=True)
         save_json(self.out / "config.json", vars(args))
 
         self.geom_warmup_steps = 600
         self.warmup_weight_floor = 0.05
+
     def _rasterize_gs(self, c2w, K, W, H, sh_degree):
         colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
         rc, ra, info = rasterization(
@@ -231,18 +234,9 @@ class Trainer:
                 keep_mask[keep] = True
                 remove(params=self.splats, optimizers=self.optimizers, state=self.state, mask=~keep_mask)
 
-            with torch.no_grad():
-                mesh_psnr = psnr(out["mesh_rgb"], out["gt"])
-                hybrid_psnr = psnr(out["hybrid"], out["gt"])
-
             step1 = step + 1
             phase = "warmup" if warmup else "full"
-            pbar.set_description(
-                f"step={step1} phase={phase} loss={loss.item():.4f} mesh_psnr={mesh_psnr:.2f} hybrid_psnr={hybrid_psnr:.2f} gs={len(self.splats['means'])}"
-            )
-
-            if self.args.save_train_vis_every > 0 and (step == 0 or step1 % self.args.save_train_vis_every == 0):
-                save_visual_pack(out, self.train_vis_dir / f"step_{step1:06d}", image_idx=0)
+            pbar.set_description(f"step={step1} phase={phase} loss={loss.item():.4f} gs={len(self.splats['means'])}")
             if step1 % self.args.save_every == 0 or step1 == self.args.max_steps:
                 self.save_ckpt(step1)
             if step1 % self.args.eval_every == 0 or step1 == self.args.max_steps:
@@ -251,7 +245,6 @@ class Trainer:
     @torch.no_grad()
     def eval(self, step: int):
         loader = torch.utils.data.DataLoader(self.valset, batch_size=1, shuffle=False, num_workers=0)
-        mesh_vals, hybrid_vals, gs_vals = [], [], []
         sel_acc: dict[str, list[float]] = {}
 
         vis_step_dir = self.vis_dir / f"step_{step:06d}"
@@ -259,10 +252,6 @@ class Trainer:
 
         for i, batch in enumerate(loader):
             out = self._forward(batch, None)
-            mesh_vals.append(psnr(out["mesh_rgb"], out["gt"]))
-            hybrid_vals.append(psnr(out["hybrid"], out["gt"]))
-            gs_vals.append(psnr(out["gs_rgb"], out["gt"]))
-
             sel = selective_metrics(
                 gt=out["gt"],
                 mesh_rgb=out["mesh_rgb"],
@@ -277,20 +266,18 @@ class Trainer:
             if i < self.args.save_vis_images:
                 save_visual_pack(out, vis_step_dir, image_idx=i)
 
-        stats = {
-            "step": step,
-            "mesh_psnr": float(np.mean(mesh_vals)),
-            "gs_psnr": float(np.mean(gs_vals)),
-            "hybrid_psnr": float(np.mean(hybrid_vals)),
-            "num_gs": int(len(self.splats["means"])),
-            "save_vis_images": int(self.args.save_vis_images),
-        }
+        stats = {"step": step, "num_gs": int(len(self.splats["means"]))}
         for k, vals in sel_acc.items():
             stats[k] = float(np.mean(vals))
         save_json(self.stats_dir / f"step_{step:06d}.json", stats)
+
         print(
-            f"[eval {step}] mesh={stats['mesh_psnr']:.3f} gs={stats['gs_psnr']:.3f} hybrid={stats['hybrid_psnr']:.3f} "
-            f"select={stats['selectivity_score']:.4f} leak={stats['leakage_good']:.4f} blur={stats['blur_regression_good']:.4f}"
+            f"[eval {step}] "
+            f"select={stats['selectivity_score']:.4f} "
+            f"repair={stats['repair_gain']:.4f} "
+            f"damage={stats['preserve_damage']:.4f} "
+            f"leak={stats['leakage_good']:.4f} "
+            f"blur={stats['blur_regression_good']:.4f}"
         )
 
     def save_ckpt(self, step: int):
@@ -314,7 +301,6 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--init_points", type=int, default=100000)
     ap.add_argument("--init_opa", type=float, default=0.1)
-    ap.add_argument("--ignore_tie_points", type=int, default=0)
     ap.add_argument("--sh_degree", type=int, default=3)
     ap.add_argument("--sh_step_interval", type=int, default=1000)
     ap.add_argument("--depth_gate_beta", type=float, default=200.0)
@@ -323,7 +309,6 @@ def parse_args():
     ap.add_argument("--means_lr_mult", type=float, default=1.0)
     ap.add_argument("--max_gs", type=int, default=0)
     ap.add_argument("--save_vis_images", type=int, default=4)
-    ap.add_argument("--save_train_vis_every", type=int, default=1000)
     return ap.parse_args()
 
 

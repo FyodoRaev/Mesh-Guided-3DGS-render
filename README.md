@@ -5,7 +5,7 @@
 - `colmap_data.py` — загрузка COLMAP txt + изображений
 - `mesh_renderer.py` — mesh RGB/depth/mask
 - `hybrid_math.py` — формулы compose/gate/weight
-- `diagnostics.py` — сохранение панелей и heatmap
+- `diagnostics.py` — сохранение минимальных диагностических карт
 - `selfcheck.py` — быстрый sanity-check
 
 ## Запуск
@@ -24,21 +24,17 @@ python train.py \
   --num_workers 0
 ```
 
-## Визуализация (минимальными усилиями)
+## Визуализация
 
 - Валид. кадры и карты: `results/.../vis/step_xxxxxx/`
-- Train-снапшоты: `results/.../train_vis/step_xxxxxx/`
 
-Полезные флаги:
+Полезный флаг:
 - `--save_vis_images 4` — сколько val-кадров сохранять на каждом eval
-- `--save_train_vis_every 1000` — как часто сохранять train snapshot (0 = выключено)
 
 Сохраняются:
-- `gt`, `mesh`, `gs`, `hybrid`
-- `weight`, `gate`, `mesh_mask`
-- `mesh_err`, `gs_err`, `hybrid_err`
+- `gt`, `mesh`, `hybrid`
+- `weight`, `gate`
 - `better_than_mesh`, `worse_than_mesh`
-- `panel` (всё вместе)
 
 ## Проверка
 
