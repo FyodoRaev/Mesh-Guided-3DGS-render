@@ -29,12 +29,6 @@ def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / c0
 
 
-def save_json(path: Path, data: dict):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-
 def init_splats(scene: ColmapScene, args, device: str):
     points_np = scene.points
     rgb_np = scene.points_rgb / 255.0
@@ -115,7 +109,6 @@ class Trainer:
         self.vis_dir = self.out / "vis"
         for d in (self.ckpt_dir, self.stats_dir, self.vis_dir):
             d.mkdir(parents=True, exist_ok=True)
-        save_json(self.out / "config.json", vars(args))
 
         self.geom_warmup_steps = 600
         self.warmup_weight_floor = 0.05
@@ -269,7 +262,6 @@ class Trainer:
         stats = {"step": step, "num_gs": int(len(self.splats["means"]))}
         for k, vals in sel_acc.items():
             stats[k] = float(np.mean(vals))
-        save_json(self.stats_dir / f"step_{step:06d}.json", stats)
 
         print(
             f"[eval {step}] "
