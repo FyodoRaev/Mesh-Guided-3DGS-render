@@ -26,19 +26,13 @@ def compose_hybrid(
     return hybrid.clamp(0.0, 1.0)
 
 
-def residual_weight_from_mesh_error(
+def mesh_rgb_error(
     gt_rgb: torch.Tensor,
     mesh_rgb: torch.Tensor,
     mesh_mask: torch.Tensor,
-    residual_scale: float,
 ) -> torch.Tensor:
     mesh_err = (mesh_rgb - gt_rgb).abs().mean(dim=-1, keepdim=True)
-    w_mesh = (mesh_err / residual_scale).clamp(0.0, 1.0)
-    return torch.where(mesh_mask.bool(), w_mesh, torch.ones_like(w_mesh)).detach()
-
-
-def weighted_l1(pred: torch.Tensor, gt: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return (weight * (pred - gt).abs()).sum() / (3.0 * weight.sum().clamp_min(1e-8))
+    return torch.where(mesh_mask.bool(), mesh_err, torch.zeros_like(mesh_err))
 
 
 def psnr(pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor | None = None) -> float:
@@ -82,7 +76,7 @@ def selective_metrics(
     good_q: float = 0.35,
     bad_q: float = 0.85,
 ) -> dict[str, float]:
-    mesh_err = (mesh_rgb - gt).abs().mean(dim=-1, keepdim=True)
+    mesh_err = mesh_rgb_error(gt, mesh_rgb, mesh_mask)
     hybrid_err = (hybrid_rgb - gt).abs().mean(dim=-1, keepdim=True)
 
     mask = mesh_mask.bool()

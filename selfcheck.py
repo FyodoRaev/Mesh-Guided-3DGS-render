@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from hybrid_math import compose_hybrid, compute_depth_gate, residual_weight_from_mesh_error, weighted_l1
+from hybrid_math import compose_hybrid, compute_depth_gate, mesh_rgb_error
 
 
 def main():
@@ -35,13 +35,10 @@ def main():
     assert torch.allclose(h1, gt, atol=1e-6)
     assert torch.allclose(h2, gt, atol=1e-6)
 
-    w_good = residual_weight_from_mesh_error(gt, gt, torch.ones_like(a, dtype=torch.bool), 0.05)
-    w_bad = residual_weight_from_mesh_error(gt, torch.zeros_like(gt), torch.ones_like(a, dtype=torch.bool), 0.05)
-    assert w_good.item() == 0.0
-    assert w_bad.item() == 1.0
-
-    l = weighted_l1(torch.ones((1, 1, 1, 3)), torch.zeros((1, 1, 1, 3)), torch.ones((1, 1, 1, 1)))
-    assert abs(l.item() - 1.0) < 1e-6
+    mesh_good = mesh_rgb_error(gt, gt, torch.ones_like(a, dtype=torch.bool))
+    mesh_bad = mesh_rgb_error(gt, torch.zeros_like(gt), torch.ones_like(a, dtype=torch.bool))
+    assert mesh_good.item() == 0.0
+    assert mesh_bad.item() > 0.0
 
     print("[OK] distillate selfcheck passed")
 
