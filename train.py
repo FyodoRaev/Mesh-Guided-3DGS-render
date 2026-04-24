@@ -53,6 +53,8 @@ def sample_tie_points(scene: ColmapScene, n: int, seed: int) -> tuple[np.ndarray
     rng = np.random.default_rng(seed)
     points = scene.points.astype(np.float32)
     colors = (scene.points_rgb / 255.0).astype(np.float32)
+    if n <= 0 or n >= len(points):
+        return points, colors
     idx = rng.choice(len(points), size=min(n, len(points)), replace=False)
     return points[idx], colors[idx]
 
@@ -326,7 +328,7 @@ def parse_args():
     ap.add_argument("--mesh_support_dir", default="")
     ap.add_argument("--force_live_mesh", action="store_true")
     ap.add_argument("--init_means_ckpt", default="")
-    ap.add_argument("--init_points", type=int, default=2000)
+    ap.add_argument("--init_points", type=int, default=0)
     ap.add_argument("--init_opacity", type=float, default=0.1)
     ap.add_argument("--max_steps", type=int, default=4000)
     ap.add_argument("--eval_every", type=int, default=500)
