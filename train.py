@@ -287,9 +287,10 @@ class HybridTrainer:
         visible = info["radii"] > 0
         if not bool(visible.any()):
             return
+        # diff-gaussian-rasterization follows the original 3DGS screenspace
+        # gradient convention; its 0.0002 threshold is used without gsplat's
+        # pixel-to-screen rescaling.
         grad = means2d.grad[:, :2].clone()
-        grad[:, 0] *= info["width"] / 2.0
-        grad[:, 1] *= info["height"] / 2.0
         idx = torch.where(visible)[0]
         self.grad2d.index_add_(0, idx, grad[idx].norm(dim=-1))
         self.grad2d_count.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
@@ -304,13 +305,14 @@ class HybridTrainer:
             return
 
         avg_grad = self.grad2d / self.grad2d_count.clamp_min(1.0)
-        scale = torch.exp(self.splats["scales"]).max(dim=-1).values / self.scene.scene_scale
+        scale = torch.exp(self.splats["scales"]).max(dim=-1).values
         grow = avg_grad > self.args.grow_grad2d
-        small = scale <= self.args.grow_scale3d
+        small = scale <= self.args.grow_scale3d * self.scene.scene_scale
         large = ~small
 
         n_before = len(self.splats["means"])
         n_dupe = int((grow & small).sum().item())
+        n_split = int((grow & large).sum().item())
         if bool((grow & small).any()):
             duplicate(self.splats, self.optimizers, {}, grow & small)
         if n_dupe > 0:
@@ -320,17 +322,23 @@ class HybridTrainer:
             split(self.splats, self.optimizers, {}, grow & large)
 
         opacity = torch.sigmoid(self.splats["opacities"])
-        scale = torch.exp(self.splats["scales"]).max(dim=-1).values / self.scene.scene_scale
-        prune_mask = (opacity < self.args.prune_opa) | (scale > self.args.prune_scale3d)
+        prune_mask = opacity < self.args.prune_opa
+        if step > self.args.reset_every:
+            scale = torch.exp(self.splats["scales"]).max(dim=-1).values
+            prune_mask |= scale > self.args.prune_scale3d * self.scene.scene_scale
+        n_prune = int(prune_mask.sum().item())
         if bool(prune_mask.any()):
             remove(self.splats, self.optimizers, {}, prune_mask)
 
-        if step % self.args.reset_every == 0:
+        if step % self.args.reset_every == 0 and step > 0:
             reset_opa(self.splats, self.optimizers, {}, value=self.args.prune_opa * 2.0)
 
         self._reset_densify_stats()
         torch.cuda.empty_cache()
-        print(f"[densify {step}] {n_before} -> {len(self.splats['means'])}")
+        print(
+            f"[densify {step}] {n_before} -> {len(self.splats['means'])} "
+            f"dupe={n_dupe} split={n_split} prune={n_prune}"
+        )
 
     def train(self):
         loader = torch.utils.data.DataLoader(self.trainset, batch_size=1, shuffle=True, num_workers=0)
