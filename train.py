@@ -11,15 +11,15 @@ import tqdm
 
 from colmap_data import ColmapScene, SceneDataset
 from diagnostics import save_json, save_visual_pack
-from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy
-from gsplat.strategy.ops import remove
+from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
 from hybrid_math import compose_hybrid, compute_depth_gate, psnr
 from mesh_renderer import MeshRenderer
 from mesh_support_cache import MeshSupportCache
 
 SH_DEGREE = 3
 SH_STEP_INTERVAL = 1000
+ZNEAR = 0.01
+ZFAR = 1e10
 
 
 def append_jsonl(path: Path, row: dict):
@@ -115,6 +115,26 @@ def frame_names_from_batch(batch: dict) -> list[str]:
     return [names] if isinstance(names, str) else [str(x) for x in names]
 
 
+def projection_from_opencv(K: torch.Tensor, width: int, height: int) -> torch.Tensor:
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    P = torch.zeros((4, 4), dtype=K.dtype, device=K.device)
+    P[0, 0] = 2.0 * fx / width
+    P[1, 1] = 2.0 * fy / height
+    P[0, 2] = 2.0 * cx / width - 1.0
+    P[1, 2] = 2.0 * cy / height - 1.0
+    P[2, 2] = ZFAR / (ZFAR - ZNEAR)
+    P[2, 3] = -(ZFAR * ZNEAR) / (ZFAR - ZNEAR)
+    P[3, 2] = 1.0
+    return P.transpose(0, 1).contiguous()
+
+
+def fov_from_K(K: torch.Tensor, width: int, height: int) -> tuple[float, float]:
+    tanfovx = 0.5 * float(width) / float(K[0, 0].detach().cpu())
+    tanfovy = 0.5 * float(height) / float(K[1, 1].detach().cpu())
+    return tanfovx, tanfovy
+
+
 class HybridTrainer:
     def __init__(self, args):
         if not torch.cuda.is_available():
@@ -144,34 +164,53 @@ class HybridTrainer:
         self.splats, init_info = init_splats(self.scene, args, self.device)
         save_json(self.out / "init.json", init_info)
         self.optimizers = make_optimizers(self.splats, self.scene.scene_scale)
-        self.strategy = DefaultStrategy(verbose=False)
-        self.strategy.check_sanity(self.splats, self.optimizers)
-        self.state = self.strategy.initialize_state(scene_scale=self.scene.scene_scale)
         self.means_sched = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizers["means"], gamma=0.01 ** (1.0 / args.max_steps)
         )
         self.metrics = self.out / "metrics.jsonl"
 
     def _rasterize_gs(self, c2w: torch.Tensor, K: torch.Tensor, width: int, height: int, step: int | None):
-        colors = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)
-        rendered, alpha, info = rasterization(
-            means=self.splats["means"],
-            quats=self.splats["quats"],
-            scales=torch.exp(self.splats["scales"]),
-            opacities=torch.sigmoid(self.splats["opacities"]),
-            colors=colors,
-            viewmats=torch.linalg.inv(c2w),
-            Ks=K,
-            width=width,
-            height=height,
-            render_mode="RGB+ED",
-            sh_degree=SH_DEGREE if step is None else min(step // SH_STEP_INTERVAL, SH_DEGREE),
-            packed=False,
-            sparse_grad=False,
-            near_plane=0.01,
-            far_plane=1e10,
-        )
-        return rendered[..., :3].clamp(0.0, 1.0), rendered[..., 3:4], alpha[..., :1], info
+        rgbs, depths, alphas = [], [], []
+        sh_degree = SH_DEGREE if step is None else min(step // SH_STEP_INTERVAL, SH_DEGREE)
+        shs = torch.cat([self.splats["sh0"], self.splats["shN"]], dim=1)[:, : (sh_degree + 1) ** 2]
+        scales = torch.exp(self.splats["scales"])
+        rotations = torch.nn.functional.normalize(self.splats["quats"], dim=-1)
+        opacities = torch.sigmoid(self.splats["opacities"])[..., None]
+        means2d = torch.zeros_like(self.splats["means"], requires_grad=True)
+
+        for i in range(c2w.shape[0]):
+            w2c = torch.linalg.inv(c2w[i])
+            view = w2c.transpose(0, 1).contiguous()
+            proj = projection_from_opencv(K[i], width, height)
+            tanfovx, tanfovy = fov_from_K(K[i], width, height)
+            settings = GaussianRasterizationSettings(
+                image_height=height,
+                image_width=width,
+                tanfovx=tanfovx,
+                tanfovy=tanfovy,
+                bg=torch.zeros(3, device=self.device),
+                scale_modifier=1.0,
+                viewmatrix=view,
+                projmatrix=(view @ proj).contiguous(),
+                sh_degree=sh_degree,
+                campos=c2w[i, :3, 3].contiguous(),
+                prefiltered=False,
+                debug=False,
+            )
+            rgb, depth, _norm, alpha, radii, _extra = GaussianRasterizer(settings)(
+                means3D=self.splats["means"],
+                means2D=means2d,
+                shs=shs,
+                colors_precomp=None,
+                opacities=opacities,
+                scales=scales,
+                rotations=rotations,
+                cov3Ds_precomp=None,
+            )
+            rgbs.append(rgb.permute(1, 2, 0).clamp(0.0, 1.0))
+            depths.append(depth.permute(1, 2, 0))
+            alphas.append(alpha.permute(1, 2, 0).clamp(0.0, 1.0))
+        return torch.stack(rgbs, 0), torch.stack(depths, 0), torch.stack(alphas, 0), {"radii": radii}
 
     def _render_mesh(self, c2w: torch.Tensor, K: torch.Tensor, width: int, height: int, names: list[str]):
         rgbs, depths, masks = [], [], []
@@ -212,9 +251,12 @@ class HybridTrainer:
         if self.args.max_gs <= 0 or len(self.splats["means"]) <= self.args.max_gs:
             return
         keep = torch.topk(torch.sigmoid(self.splats["opacities"].detach()), k=self.args.max_gs).indices
-        mask = torch.ones(len(self.splats["means"]), dtype=torch.bool, device=self.device)
-        mask[keep] = False
-        remove(params=self.splats, optimizers=self.optimizers, state=self.state, mask=mask)
+        for name, value in list(self.splats.items()):
+            self.splats[name] = torch.nn.Parameter(value.detach()[keep].clone())
+        self.optimizers = make_optimizers(self.splats, self.scene.scene_scale)
+        self.means_sched = torch.optim.lr_scheduler.ExponentialLR(
+            self.optimizers["means"], gamma=0.01 ** (1.0 / self.args.max_steps)
+        )
 
     def train(self):
         loader = torch.utils.data.DataLoader(self.trainset, batch_size=1, shuffle=True, num_workers=0)
@@ -227,7 +269,6 @@ class HybridTrainer:
                 batch = next(iterator)
 
             out = self.forward(batch, step)
-            self.strategy.step_pre_backward(self.splats, self.optimizers, self.state, step, out["info"])
             for opt in self.optimizers.values():
                 opt.zero_grad(set_to_none=True)
             loss = (out["hybrid"] - out["gt"]).abs().mean()
@@ -235,7 +276,6 @@ class HybridTrainer:
             for opt in self.optimizers.values():
                 opt.step()
             self.means_sched.step()
-            self.strategy.step_post_backward(self.splats, self.optimizers, self.state, step, out["info"], packed=False)
             self.prune_to_max_gs()
 
             step1 = step + 1
