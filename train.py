@@ -12,6 +12,7 @@ import tqdm
 from colmap_data import ColmapScene, SceneDataset
 from diagnostics import save_json, save_visual_pack
 from diff_gauss import GaussianRasterizationSettings, GaussianRasterizer
+from gsplat.strategy.ops import duplicate, remove, reset_opa, split
 from hybrid_math import compose_hybrid, compute_depth_gate, psnr
 from mesh_renderer import MeshRenderer
 from mesh_support_cache import MeshSupportCache
@@ -170,6 +171,8 @@ class HybridTrainer:
             self.optimizers["means"], gamma=0.01 ** (1.0 / args.max_steps)
         )
         self.metrics = self.out / "metrics.jsonl"
+        self.grad2d = None
+        self.grad2d_count = None
 
     def _rasterize_gs(self, c2w: torch.Tensor, K: torch.Tensor, width: int, height: int, step: int | None):
         rgbs, depths, alphas = [], [], []
@@ -179,6 +182,7 @@ class HybridTrainer:
         rotations = torch.nn.functional.normalize(self.splats["quats"], dim=-1)
         opacities = torch.sigmoid(self.splats["opacities"])[..., None]
         means2d = torch.zeros_like(self.splats["means"], requires_grad=True)
+        radii_last = None
 
         for i in range(c2w.shape[0]):
             w2c = torch.linalg.inv(c2w[i])
@@ -212,7 +216,13 @@ class HybridTrainer:
             rgbs.append(rgb.permute(1, 2, 0).clamp(0.0, 1.0))
             depths.append(depth.permute(1, 2, 0))
             alphas.append(alpha.permute(1, 2, 0).clamp(0.0, 1.0))
-        return torch.stack(rgbs, 0), torch.stack(depths, 0), torch.stack(alphas, 0), {"radii": radii}
+            radii_last = radii
+        return torch.stack(rgbs, 0), torch.stack(depths, 0), torch.stack(alphas, 0), {
+            "means2d": means2d,
+            "radii": radii_last,
+            "width": width,
+            "height": height,
+        }
 
     def _render_mesh(self, c2w: torch.Tensor, K: torch.Tensor, width: int, height: int, names: list[str]):
         rgbs, depths, masks = [], [], []
@@ -259,6 +269,68 @@ class HybridTrainer:
         self.means_sched = torch.optim.lr_scheduler.ExponentialLR(
             self.optimizers["means"], gamma=0.01 ** (1.0 / self.args.max_steps)
         )
+        self.grad2d = None
+        self.grad2d_count = None
+
+    def _reset_densify_stats(self):
+        n = len(self.splats["means"])
+        self.grad2d = torch.zeros(n, device=self.device)
+        self.grad2d_count = torch.zeros(n, device=self.device)
+
+    @torch.no_grad()
+    def _accumulate_densify_stats(self, info: dict):
+        means2d = info["means2d"]
+        if means2d.grad is None:
+            return
+        if self.grad2d is None or self.grad2d.shape[0] != len(self.splats["means"]):
+            self._reset_densify_stats()
+        visible = info["radii"] > 0
+        if not bool(visible.any()):
+            return
+        grad = means2d.grad[:, :2].clone()
+        grad[:, 0] *= info["width"] / 2.0
+        grad[:, 1] *= info["height"] / 2.0
+        idx = torch.where(visible)[0]
+        self.grad2d.index_add_(0, idx, grad[idx].norm(dim=-1))
+        self.grad2d_count.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+
+    @torch.no_grad()
+    def _densify_and_prune(self, step: int):
+        if self.args.refine_every <= 0 or step <= self.args.refine_start_iter or step >= self.args.refine_stop_iter:
+            return
+        if step % self.args.refine_every != 0:
+            return
+        if self.grad2d is None:
+            return
+
+        avg_grad = self.grad2d / self.grad2d_count.clamp_min(1.0)
+        scale = torch.exp(self.splats["scales"]).max(dim=-1).values / self.scene.scene_scale
+        grow = avg_grad > self.args.grow_grad2d
+        small = scale <= self.args.grow_scale3d
+        large = ~small
+
+        n_before = len(self.splats["means"])
+        n_dupe = int((grow & small).sum().item())
+        if bool((grow & small).any()):
+            duplicate(self.splats, self.optimizers, {}, grow & small)
+        if n_dupe > 0:
+            large = torch.cat([large, torch.zeros(n_dupe, dtype=torch.bool, device=self.device)])
+            grow = torch.cat([grow, torch.zeros(n_dupe, dtype=torch.bool, device=self.device)])
+        if bool((grow & large).any()):
+            split(self.splats, self.optimizers, {}, grow & large)
+
+        opacity = torch.sigmoid(self.splats["opacities"])
+        scale = torch.exp(self.splats["scales"]).max(dim=-1).values / self.scene.scene_scale
+        prune_mask = (opacity < self.args.prune_opa) | (scale > self.args.prune_scale3d)
+        if bool(prune_mask.any()):
+            remove(self.splats, self.optimizers, {}, prune_mask)
+
+        if step % self.args.reset_every == 0:
+            reset_opa(self.splats, self.optimizers, {}, value=self.args.prune_opa * 2.0)
+
+        self._reset_densify_stats()
+        torch.cuda.empty_cache()
+        print(f"[densify {step}] {n_before} -> {len(self.splats['means'])}")
 
     def train(self):
         loader = torch.utils.data.DataLoader(self.trainset, batch_size=1, shuffle=True, num_workers=0)
@@ -271,13 +343,16 @@ class HybridTrainer:
                 batch = next(iterator)
 
             out = self.forward(batch, step)
+            out["info"]["means2d"].retain_grad()
             for opt in self.optimizers.values():
                 opt.zero_grad(set_to_none=True)
             loss = (out["hybrid"] - out["gt"]).abs().mean()
             loss.backward()
+            self._accumulate_densify_stats(out["info"])
             for opt in self.optimizers.values():
                 opt.step()
             self.means_sched.step()
+            self._densify_and_prune(step + 1)
             self.prune_to_max_gs()
 
             step1 = step + 1
@@ -339,6 +414,14 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gate_eps", type=float, default=1e-4)
     ap.add_argument("--gate_band", type=float, default=0.02)
+    ap.add_argument("--prune_opa", type=float, default=0.005)
+    ap.add_argument("--grow_grad2d", type=float, default=0.0002)
+    ap.add_argument("--grow_scale3d", type=float, default=0.01)
+    ap.add_argument("--prune_scale3d", type=float, default=0.1)
+    ap.add_argument("--refine_start_iter", type=int, default=500)
+    ap.add_argument("--refine_stop_iter", type=int, default=15000)
+    ap.add_argument("--refine_every", type=int, default=100)
+    ap.add_argument("--reset_every", type=int, default=3000)
     return ap.parse_args()
 
 
