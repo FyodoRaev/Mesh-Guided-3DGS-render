@@ -5,6 +5,7 @@ from pathlib import Path
 
 import imageio.v2 as imageio
 import numpy as np
+from PIL import Image
 import torch
 
 
@@ -42,6 +43,15 @@ class Frame:
     image_path: Path
     K: np.ndarray
     c2w: np.ndarray
+    width: int
+    height: int
+
+
+def read_image_size(image_path: str | Path) -> tuple[int, int]:
+    path = Path(image_path)
+    with Image.open(path) as img:
+        width, height = img.size
+    return int(width), int(height)
 
 
 class ColmapScene:
@@ -70,35 +80,39 @@ class ColmapScene:
                 params = list(map(float, t[4:]))
                 cams[cam_id] = parse_K(model, params)
 
-        valid_lines = []
+        frames = []
         with open(self.sparse_dir / "images.txt", "r", encoding="utf-8") as f:
             for line in f:
                 line = line.rstrip("\n")
                 if not line or line.startswith("#"):
                     continue
-                valid_lines.append(line)
+                t = line.split()
+                if len(t) < 10:
+                    continue
+                name = " ".join(t[9:])
+                if Path(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}:
+                    continue
+                qvec = np.array(list(map(float, t[1:5])), dtype=np.float32)
+                tvec = np.array(list(map(float, t[5:8])), dtype=np.float32)
+                cam_id = int(t[8])
 
-        frames = []
-        for i in range(0, len(valid_lines), 2):
-            t = valid_lines[i].split()
-            qvec = np.array(list(map(float, t[1:5])), dtype=np.float32)
-            tvec = np.array(list(map(float, t[5:8])), dtype=np.float32)
-            cam_id = int(t[8])
-            name = " ".join(t[9:])
+                R = qvec2rotmat(qvec)
+                c2w = np.eye(4, dtype=np.float32)
+                c2w[:3, :3] = R.T
+                c2w[:3, 3] = -R.T @ tvec
 
-            R = qvec2rotmat(qvec)
-            c2w = np.eye(4, dtype=np.float32)
-            c2w[:3, :3] = R.T
-            c2w[:3, 3] = -R.T @ tvec
-
-            frames.append(
-                Frame(
-                    name=name,
-                    image_path=self.images_dir / name,
-                    K=cams[cam_id],
-                    c2w=c2w,
+                image_path = self.images_dir / name
+                width, height = read_image_size(image_path)
+                frames.append(
+                    Frame(
+                        name=name,
+                        image_path=image_path,
+                        K=cams[cam_id],
+                        c2w=c2w,
+                        width=width,
+                        height=height,
+                    )
                 )
-            )
 
         frames.sort(key=lambda x: x.name)
         return frames
@@ -135,6 +149,8 @@ class SceneDataset(torch.utils.data.Dataset):
             self.indices = scene.train_idx
         elif split == "val":
             self.indices = scene.val_idx
+        elif split == "all":
+            self.indices = np.arange(len(scene.frames))
         else:
             raise ValueError(split)
 
@@ -142,7 +158,8 @@ class SceneDataset(torch.utils.data.Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        f = self.scene.frames[int(self.indices[idx])]
+        frame_idx = int(self.indices[idx])
+        f = self.scene.frames[frame_idx]
         img = imageio.imread(f.image_path)
         if img.ndim == 2:
             img = np.repeat(img[..., None], 3, axis=-1)
@@ -152,4 +169,6 @@ class SceneDataset(torch.utils.data.Dataset):
             "image": torch.from_numpy(img.copy()),
             "camtoworld": torch.from_numpy(f.c2w.copy()),
             "K": torch.from_numpy(f.K.copy()),
+            "frame_index": torch.tensor(frame_idx, dtype=torch.int64),
+            "frame_name": f.name,
         }

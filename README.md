@@ -1,58 +1,28 @@
-# Distillate (radically simplified)
+# Distillate
 
-Минимальный пайплайн из двух шагов:
+Минимальный mesh + 3DGS hybrid.
 
-1. `positions_pretrain_minimal.py` — pretrain только `means` (притягивание проекций к bad-зонам mesh).
-2. `train.py` — hybrid GS+mesh training с инициализацией `means` из шага 1.
+Mesh во время обучения берётся из `scene_dir/mesh_support/*.npz`, если кеш полный. Если кеша нет или он неполный, `train.py` рендерит mesh live через тот же `MeshRenderer`.
 
-## Файлы
-
-- `positions_pretrain_minimal.py` — pretrain позиций + визуализации `before/after/bad`
-- `train.py` — hybrid training + eval
-- `diagnostics.py` — 4 eval-визуализации: `mesh`, `gs`, `hybrid`, `compare`
-- `hybrid_math.py` — глубинный gate + hybrid compose + PSNR
-- `colmap_data.py` — загрузка COLMAP
-- `mesh_renderer.py` — mesh render (rgb/depth/mask)
-- `selfcheck.py` — sanity-check математики
-
-## Шаг 1: pretrain means
+## Precompute mesh
 
 ```bash
-cd /home/agisoft/PycharmProjects/HybridGSMesh/distillate
-source .venv-gs3090/bin/activate
-
-python positions_pretrain_minimal.py \
-  --scene_dir ../scene \
-  --mesh_obj ../scene/yellow_car.obj \
-  --result_dir runs/positions_pretrain_minimal
+python precompute_mesh_support.py \
+  --scene_dir ../scene_yellow_car \
+  --mesh_obj ../scene_yellow_car/yellow_car.obj
 ```
 
-Артефакты:
-- `runs/positions_pretrain_minimal/ckpts/ckpt_*.pt`
-- `runs/positions_pretrain_minimal/stats/eval_*.json`
-- `runs/positions_pretrain_minimal/vis/step_*/{train,val}_*_before_after.png`
+Скрипт сохраняет `rgb/depth/mask`, сразу перечитывает `.npz` через `MeshSupportCache` и падает, если cache != live slow render. Первые кадры получают `check_*.png`: live | cache | diff.
 
-## Шаг 2: hybrid training
+## Hybrid train
 
 ```bash
 python train.py \
-  --scene_dir ../scene \
-  --mesh_obj ../scene/yellow_car.obj \
-  --init_means_ckpt runs/positions_pretrain_minimal/ckpts/ckpt_001000.pt \
-  --result_dir runs/hybrid_from_pretrain
+  --scene_dir ../scene_yellow_car \
+  --mesh_obj ../scene_yellow_car/yellow_car.obj \
+  --result_dir runs/hybrid_simple
 ```
 
-Артефакты:
-- `runs/hybrid_from_pretrain/ckpts/ckpt_*.pt`
-- `runs/hybrid_from_pretrain/stats/eval_*.json`
-- `runs/hybrid_from_pretrain/vis/step_*/0000_mesh.png`
-- `runs/hybrid_from_pretrain/vis/step_*/0000_gs.png`
-- `runs/hybrid_from_pretrain/vis/step_*/0000_hybrid.png`
-- `runs/hybrid_from_pretrain/vis/step_*/0000_compare.png`
+Главные флаги: `--mesh_support_dir`, `--force_live_mesh`, `--init_means_ckpt`, `--init_points`, `--max_steps`, `--eval_every`, `--save_every`, `--max_gs`, `--gate_eps`, `--gate_band`.
 
-## Проверка
-
-```bash
-python selfcheck.py
-python -m py_compile *.py
-```
+Pure 3DGS baseline оставлен отдельно: `train_gs_only.py`.
