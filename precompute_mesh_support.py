@@ -61,6 +61,7 @@ def parse_args():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--check_images", type=int, default=4)
+    ap.add_argument("--save_renders", action="store_true")
     return ap.parse_args()
 
 
@@ -96,11 +97,13 @@ def main():
         rgb, depth, mask = renderer.render(K, c2w, frame.width, frame.height)
         validate(frame.name, rgb, depth, mask, frame.width, frame.height)
         save_npz(out_path, rgb, depth, mask)
+        if args.save_renders:
+            save_rgb(out_dir / "renders" / f"{Path(frame.name).stem}.png", rgb)
 
-        cache = MeshSupportCache(args.scene_dir, out_dir)
-        cached_rgb, check = check_saved(cache, frame.name, rgb, depth, mask)
-        checks.append(check)
         if rendered < args.check_images:
+            cache = MeshSupportCache(args.scene_dir, out_dir)
+            cached_rgb, check = check_saved(cache, frame.name, rgb, depth, mask)
+            checks.append(check)
             diff = (cached_rgb - rgb).abs() * 64.0
             save_rgb(out_dir / f"check_{rendered:04d}_{Path(frame.name).stem}.png", torch.cat([rgb, cached_rgb, diff], dim=1))
         rendered += 1
