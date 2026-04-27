@@ -12,9 +12,6 @@ def compute_depth_gate(
 ) -> torch.Tensor:
     margin = mesh_depth - gs_depth - eps
     hard = (margin >= 0.0).to(gs_depth.dtype)
-    if band > 0.0:
-        soft = torch.clamp(0.5 + margin / band, 0.0, 1.0)
-        hard = hard + soft - soft.detach()
     return torch.where(mesh_mask.bool(), hard, torch.ones_like(hard))
 
 
