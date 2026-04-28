@@ -36,9 +36,10 @@ def save_visual_pack(out: dict, out_dir: Path, image_idx: int):
     mesh = out["mesh_rgb"][0]
     gs = out["gs_rgb"][0]
     hybrid = out["hybrid"][0]
+    gt = out["gt"][0]
     compare = torch.cat([out["gt"][0], mesh, gs, hybrid], dim=1)
     stem = f"{image_idx:04d}"
     save_rgb(out_dir / f"{stem}_mesh.png", mesh)
-    save_rgb(out_dir / f"{stem}_gs.png", gs)
     save_rgb(out_dir / f"{stem}_hybrid.png", hybrid)
+    save_rgb(out_dir / f"{stem}_gt.png", gt)
     save_rgb(out_dir / f"{stem}_compare.png", compare)

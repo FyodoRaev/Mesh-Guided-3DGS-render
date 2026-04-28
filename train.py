@@ -33,21 +33,6 @@ def rgb_to_sh(rgb: torch.Tensor) -> torch.Tensor:
     return (rgb - 0.5) / 0.28209479177387814
 
 
-def load_means(path: str | Path) -> np.ndarray:
-    path = Path(path)
-    if path.suffix == ".npz":
-        with np.load(path, allow_pickle=False) as data:
-            key = "means" if "means" in data else "points"
-            return np.asarray(data[key], dtype=np.float32)
-    data = torch.load(path, map_location="cpu")
-    means = data.get("means") if isinstance(data, dict) else None
-    if means is None and isinstance(data, dict) and isinstance(data.get("splats"), dict):
-        means = data["splats"].get("means")
-    if means is None:
-        raise RuntimeError(f"could not find means in {path}")
-    return means.detach().cpu().float().numpy().astype(np.float32)
-
-
 def sample_tie_points(scene: ColmapScene, n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
     if len(scene.points) == 0:
         raise RuntimeError("No COLMAP tie-points found")
@@ -74,13 +59,8 @@ def nearest_scene_rgb(scene: ColmapScene, points: np.ndarray) -> np.ndarray:
 
 
 def init_splats(scene: ColmapScene, args, device: str):
-    if args.init_means_ckpt:
-        points = load_means(args.init_means_ckpt)
-        colors = nearest_scene_rgb(scene, points)
-        source = "means_ckpt"
-    else:
-        points, colors = sample_tie_points(scene, args.init_points, args.seed)
-        source = "tie_points"
+    points, colors = sample_tie_points(scene, args.init_points, args.seed)
+    source = "tie_points"
 
     n = len(points)
     scale = max(scene.scene_scale / 80.0, 1e-4)
@@ -146,6 +126,8 @@ class HybridTrainer:
         self.device = "cuda"
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
+        if args.max_gs > 0:
+            print("[warn] --max_gs is ignored; opacity threshold pruning uses --prune_opa")
 
         self.scene = ColmapScene(args.scene_dir, test_every=args.test_every)
         self.trainset = SceneDataset(self.scene, split="train")
@@ -160,7 +142,12 @@ class HybridTrainer:
 
         self.cache = MeshSupportCache(args.scene_dir, args.mesh_support_dir or None)
         cached = sum(self.cache.has_frame(f.name) for f in self.scene.frames)
-        self.use_live_mesh = args.force_live_mesh or cached != len(self.scene.frames)
+        if cached != len(self.scene.frames) and not args.force_live_mesh:
+            raise RuntimeError(
+                f"mesh support incomplete: cached={cached}/{len(self.scene.frames)}. "
+                "Run precompute_mesh_support.py first, or pass --force_live_mesh."
+            )
+        self.use_live_mesh = args.force_live_mesh
         self.mesh = MeshRenderer(args.mesh_obj, self.device) if self.use_live_mesh else None
         print(f"[mesh] source={'live' if self.use_live_mesh else 'cache'} cached={cached}/{len(self.scene.frames)}")
 
@@ -173,6 +160,8 @@ class HybridTrainer:
         self.metrics = self.out / "metrics.jsonl"
         self.grad2d = None
         self.grad2d_count = None
+        self.opacity_pruned_since_log = 0
+        self.opacity_prune_log_start = None
 
     def _rasterize_gs(self, c2w: torch.Tensor, K: torch.Tensor, width: int, height: int, step: int | None):
         rgbs, depths, alphas = [], [], []
@@ -259,19 +248,6 @@ class HybridTrainer:
             "info": info,
         }
 
-    def prune_to_max_gs(self):
-        if self.args.max_gs <= 0 or len(self.splats["means"]) <= self.args.max_gs:
-            return
-        keep = torch.topk(torch.sigmoid(self.splats["opacities"].detach()), k=self.args.max_gs).indices
-        for name, value in list(self.splats.items()):
-            self.splats[name] = torch.nn.Parameter(value.detach()[keep].clone())
-        self.optimizers = make_optimizers(self.splats, self.scene.scene_scale)
-        self.means_sched = torch.optim.lr_scheduler.ExponentialLR(
-            self.optimizers["means"], gamma=0.01 ** (1.0 / self.args.max_steps)
-        )
-        self.grad2d = None
-        self.grad2d_count = None
-
     def _reset_densify_stats(self):
         n = len(self.splats["means"])
         self.grad2d = torch.zeros(n, device=self.device)
@@ -354,14 +330,17 @@ class HybridTrainer:
             out["info"]["means2d"].retain_grad()
             for opt in self.optimizers.values():
                 opt.zero_grad(set_to_none=True)
-            loss = (out["hybrid"] - out["gt"]).abs().mean()
+            gs_color = (out["gs_rgb"] / out["gs_alpha"].clamp_min(1e-3)).clamp(0.0, 1.0)
+            color_gap = (gs_color - out["mesh_rgb"]).abs().mean(dim=-1, keepdim=True).detach()
+            loss = (out["hybrid"] - out["gt"]).abs().mean() + 1e-3 * (
+                out["gs_alpha"] * out["gate"] * out["mesh_mask"].float() / color_gap.clamp_min(1e-3)
+            ).mean()
             loss.backward()
             self._accumulate_densify_stats(out["info"])
             for opt in self.optimizers.values():
                 opt.step()
             self.means_sched.step()
             self._densify_and_prune(step + 1)
-            self.prune_to_max_gs()
 
             step1 = step + 1
             append_jsonl(
@@ -413,16 +392,18 @@ def parse_args():
     ap.add_argument("--init_means_ckpt", default="")
     ap.add_argument("--init_points", type=int, default=0)
     ap.add_argument("--init_opacity", type=float, default=0.1)
-    ap.add_argument("--max_steps", type=int, default=4000)
+    ap.add_argument("--max_steps", type=int, default=30000)
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--save_every", type=int, default=500)
-    ap.add_argument("--save_vis_images", type=int, default=4)
-    ap.add_argument("--max_gs", type=int, default=0)
+    ap.add_argument("--save_vis_images", type=int, default=10)
+    ap.add_argument("--max_gs", type=int, default=0, help="Deprecated; ignored. Use --prune_opa.")
     ap.add_argument("--test_every", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--gate_eps", type=float, default=1e-4)
     ap.add_argument("--gate_band", type=float, default=0.02)
-    ap.add_argument("--prune_opa", type=float, default=0.005)
+    ap.add_argument("--prune_opa", type=float, default=0.01)
+    ap.add_argument("--opacity_prune_every", type=int, default=100)
+    ap.add_argument("--opacity_prune_log_every", type=int, default=500)
     ap.add_argument("--grow_grad2d", type=float, default=0.0002)
     ap.add_argument("--grow_scale3d", type=float, default=0.01)
     ap.add_argument("--prune_scale3d", type=float, default=0.1)
